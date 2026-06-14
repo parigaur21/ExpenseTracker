@@ -1,0 +1,48 @@
+# Build output
+dist/
+
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+coverage/
+
+# Prisma temp
+prisma/*.db
+prisma/*.db-journal
+
+# Uploads
+uploads/
+
+# Git
+.git/
+.gitignore
+
+# Docs
+*.md
+AI_USAGE.md
+DECISIONS.md
+SCOPE.md
+
+# Frontend (not needed in backend image)
+frontend/
+
+# Old backend
+backend/
+backend-node/
+
+# Tests (not needed in production image)
+src/**/__tests__/
+jest.config.ts
