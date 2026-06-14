@@ -1,0 +1,17 @@
+services:
+  db:
+    image: postgres:16
+    container_name: spreetail-expenses-db
+    environment:
+      POSTGRES_DB: shared_expenses
+      POSTGRES_USER: spreetail
+      POSTGRES_PASSWORD: spreetail
+    ports:
+      - "5432:5432"
+    volumes:
+      - spreetail-db:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+
+volumes:
+  spreetail-db:
+
