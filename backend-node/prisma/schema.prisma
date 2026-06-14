@@ -1,0 +1,140 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  display_name String   @db.VarChar(120)
+  username     String   @unique @db.VarChar(80)
+  email        String   @unique @db.VarChar(160)
+  password_hash String   @db.VarChar(255)
+  created_at   DateTime @default(now())
+  groupsCreated Group[] @relation("CreatedGroups")
+  memberships  GroupMembership[]
+  expensesPaid Expense[] @relation("PaidExpenses")
+  settlementsPaid Settlement[] @relation("PaidSettlements")
+  settlementsReceived Settlement[] @relation("ReceivedSettlements")
+  imports      Import[]
+  auditLogs    AuditLog[]
+  expenseSplits ExpenseSplit[]
+}
+
+model Group {
+  id            String   @id @default(uuid())
+  name          String   @db.VarChar(160)
+  base_currency String   @default("INR") @db.Char(3)
+  created_by    String?
+  created_at    DateTime @default(now())
+  creator       User?    @relation("CreatedGroups", fields: [created_by], references: [id])
+  memberships   GroupMembership[]
+  expenses      Expense[]
+  settlements   Settlement[]
+  imports       Import[]
+  auditLogs     AuditLog[]
+}
+
+model GroupMembership {
+  id        String   @id @default(uuid())
+  group_id  String
+  user_id   String
+  joined_on DateTime
+  left_on   DateTime?
+  role      String   @default("MEMBER") @db.VarChar(30)
+  group     Group    @relation(fields: [group_id], references: [id])
+  user      User     @relation(fields: [user_id], references: [id])
+  @@unique([group_id, user_id, joined_on])
+}
+
+model Expense {
+  id               String   @id @default(uuid())
+  group_id         String
+  paid_by_user_id  String
+  expense_date     DateTime
+  description      String   @db.VarChar(255)
+  original_amount  Decimal   @db.Decimal(14,2)
+  original_currency String   @db.Char(3)
+  exchange_rate    Decimal   @db.Decimal(14,6)
+  converted_amount Decimal   @db.Decimal(14,2)
+  split_type       String   @db.VarChar(30)
+  source_import_id String?
+  source_row_number Int?
+  created_at       DateTime @default(now())
+  group            Group    @relation(fields: [group_id], references: [id])
+  payer            User     @relation("PaidExpenses", fields: [paid_by_user_id], references: [id])
+  splits           ExpenseSplit[]
+}
+
+model ExpenseSplit {
+  id          String   @id @default(uuid())
+  expense_id  String
+  user_id     String
+  amount      Decimal   @db.Decimal(14,2)
+  percentage  Decimal?  @db.Decimal(8,4)
+  share_units Decimal?  @db.Decimal(10,4)
+  expense     Expense @relation(fields: [expense_id], references: [id])
+  user        User    @relation(fields: [user_id], references: [id])
+}
+
+model Settlement {
+  id               String   @id @default(uuid())
+  group_id         String
+  paid_by_user_id  String
+  paid_to_user_id  String
+  settlement_date  DateTime
+  original_amount  Decimal   @db.Decimal(14,2)
+  original_currency String   @db.Char(3)
+  exchange_rate    Decimal   @db.Decimal(14,6)
+  converted_amount Decimal   @db.Decimal(14,2)
+  notes            String?  @db.VarChar(500)
+  created_at       DateTime @default(now())
+  group            Group    @relation(fields: [group_id], references: [id])
+  payer            User     @relation("PaidSettlements", fields: [paid_by_user_id], references: [id])
+  payee            User     @relation("ReceivedSettlements", fields: [paid_to_user_id], references: [id])
+}
+
+model Import {
+  id           String   @id @default(uuid())
+  group_id     String
+  file_name    String   @db.VarChar(255)
+  status       String   @db.VarChar(30)
+  total_rows   Int
+  accepted_rows Int
+  skipped_rows Int
+  blocked_rows Int
+  review_rows  Int
+  created_by   String?
+  created_at   DateTime @default(now())
+  group        Group    @relation(fields: [group_id], references: [id])
+  creator      User?    @relation(fields: [created_by], references: [id])
+  anomalies    Anomaly[]
+}
+
+model Anomaly {
+  id        String   @id @default(uuid())
+  import_id String
+  row_number Int
+  type      String   @db.VarChar(80)
+  severity  String   @db.VarChar(20)
+  action    String   @db.VarChar(20)
+  message   String   @db.VarChar(800)
+  raw_row   String   @db.Text
+  import    Import   @relation(fields: [import_id], references: [id])
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  actor_user_id String?
+  group_id    String?
+  action      String   @db.VarChar(80)
+  entity_type String   @db.VarChar(80)
+  entity_id   String?
+  details     String?  @db.Text
+  created_at  DateTime @default(now())
+  actor       User?    @relation(fields: [actor_user_id], references: [id])
+  group       Group?   @relation(fields: [group_id], references: [id])
+}

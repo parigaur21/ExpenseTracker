@@ -1,0 +1,2 @@
+export type Decimal = number;
+
