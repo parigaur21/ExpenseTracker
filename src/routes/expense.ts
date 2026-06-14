@@ -1,129 +1,183 @@
-// src/routes/expense.ts
-import { Router, Request, Response } from "express";
-import { prisma } from "../server";
-import { requireAuth, AuthRequest } from "../middleware/auth";
-import { upload } from "../middleware/upload";
-import fastCsv from "fast-csv";
-import axios from "axios";
-import { v4 as uuidv4 } from "uuid";
+import { Router, Response } from 'express';
+import prisma from '../prisma';
+import { requireAuth, AuthRequest } from '../middleware/auth';
+import { upload } from '../middleware/upload';
+import * as fastCsv from 'fast-csv';
+import { fetchRate } from '../services/currency';
+import { Readable } from 'stream';
 
 const router = Router();
 router.use(requireAuth);
 
-/**
- * GET /api/expenses/:groupId
- * Returns all expenses for a group (already converted to group.base_currency).
- */
+// GET /api/expenses/:groupId
 router.get('/:groupId', async (req: AuthRequest, res: Response) => {
-  const { groupId } = req.params;
-  const expenses = await prisma.expenses.findMany({
-    where: { group_id: groupId },
-    include: { expense_splits: true },
-    orderBy: { expense_date: 'desc' },
-  });
-  res.json(expenses);
+  try {
+    const { groupId } = req.params;
+    const expenses = await prisma.expense.findMany({
+      where: { group_id: groupId },
+      include: {
+        splits: { include: { user: { select: { id: true, display_name: true } } } },
+        payer: { select: { id: true, display_name: true } },
+      },
+      orderBy: { expense_date: 'desc' },
+    });
+    res.json({ expenses });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-/**
- * POST /api/expenses/:groupId
- * Create a new expense (single split or equal split).
- */
+// POST /api/expenses/:groupId
 router.post('/:groupId', async (req: AuthRequest, res: Response) => {
-  const { groupId } = req.params;
-  const { paidBy, description, amount, currency, expenseDate, splitType, splits } = req.body;
-  if (!paidBy || !description || !amount || !currency || !expenseDate || !splitType) {
-    return res.status(400).json({ error: "Missing required fields" });
+  try {
+    const { groupId } = req.params;
+    const { paidBy, description, amount, currency, expenseDate, splitType, splits } = req.body;
+    if (!paidBy || !description || !amount || !currency || !expenseDate || !splitType) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    const group = await prisma.group.findUnique({ where: { id: groupId } });
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+    const targetCurrency = group.base_currency;
+    const exchangeRate = currency === targetCurrency ? 1 : await fetchRate(currency, targetCurrency);
+    const convertedAmount = Number(amount) * exchangeRate;
+
+    const expense = await prisma.expense.create({
+      data: {
+        group_id: groupId,
+        paid_by_user_id: paidBy,
+        expense_date: new Date(expenseDate),
+        description,
+        original_amount: Number(amount),
+        original_currency: currency,
+        exchange_rate: exchangeRate,
+        converted_amount: convertedAmount,
+        split_type: splitType,
+      },
+    });
+
+    // Create splits based on type
+    if (Array.isArray(splits) && splits.length > 0) {
+      if (splitType === 'EQUAL') {
+        const perUser = convertedAmount / splits.length;
+        await Promise.all(
+          splits.map((userId: string) =>
+            prisma.expenseSplit.create({
+              data: { expense_id: expense.id, user_id: userId, amount: perUser },
+            })
+          )
+        );
+      } else if (splitType === 'EXACT') {
+        // splits = [{ userId, amount }]
+        await Promise.all(
+          splits.map((s: { userId: string; amount: number }) =>
+            prisma.expenseSplit.create({
+              data: { expense_id: expense.id, user_id: s.userId, amount: s.amount },
+            })
+          )
+        );
+      } else if (splitType === 'PERCENTAGE') {
+        // splits = [{ userId, percentage }]
+        await Promise.all(
+          splits.map((s: { userId: string; percentage: number }) =>
+            prisma.expenseSplit.create({
+              data: {
+                expense_id: expense.id,
+                user_id: s.userId,
+                amount: (s.percentage / 100) * convertedAmount,
+                percentage: s.percentage,
+              },
+            })
+          )
+        );
+      } else if (splitType === 'SHARE') {
+        // splits = [{ userId, shares }]
+        const totalShares = splits.reduce((sum: number, s: any) => sum + Number(s.shares), 0);
+        await Promise.all(
+          splits.map((s: { userId: string; shares: number }) =>
+            prisma.expenseSplit.create({
+              data: {
+                expense_id: expense.id,
+                user_id: s.userId,
+                amount: (Number(s.shares) / totalShares) * convertedAmount,
+                share_units: Number(s.shares),
+              },
+            })
+          )
+        );
+      }
+    }
+
+    const result = await prisma.expense.findUnique({
+      where: { id: expense.id },
+      include: { splits: true },
+    });
+    res.status(201).json({ expense: result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
   }
-  // Get exchange rate to group's base currency (assume INR for now)
-  const group = await prisma.groups.findUnique({ where: { id: groupId } });
-  const targetCurrency = group?.base_currency ?? "INR";
-  const exchangeRate = currency === targetCurrency ? 1 : await fetchRate(currency, targetCurrency);
-  const convertedAmount = Number(amount) * exchangeRate;
-
-  const expense = await prisma.expenses.create({
-    data: {
-      id: uuidv4(),
-      group_id: groupId,
-      paid_by_user_id: paidBy,
-      expense_date: new Date(expenseDate),
-      description,
-      original_amount: Number(amount),
-      original_currency: currency,
-      exchange_rate: exchangeRate,
-      converted_amount: convertedAmount,
-      split_type: splitType,
-    },
-  });
-
-  // Handle splits (if splitType is "EQUAL" we create equal splits)
-  if (splitType === "EQUAL" && Array.isArray(splits) && splits.length > 0) {
-    const perUser = Number(convertedAmount) / splits.length;
-    await Promise.all(
-      splits.map((userId: string) =>
-        prisma.expense_splits.create({
-          data: {
-            id: uuidv4(),
-            expense_id: expense.id,
-            user_id: userId,
-            amount: perUser,
-          },
-        })
-      )
-    );
-  }
-
-  res.status(201).json({ expense });
 });
 
-/**
- * POST /api/expenses/:groupId/import
- * Accept a CSV file (multipart/form‑data, field name "file") and import rows.
- */
+// POST /api/expenses/:groupId/import
 router.post('/:groupId/import', upload.single('file'), async (req: AuthRequest, res: Response) => {
-  const { groupId } = req.params;
-  const file = req.file;
-  if (!file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    const { groupId } = req.params;
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: 'No file uploaded' });
 
-  // Create import record
-  const importRec = await prisma.imports.create({
-    data: {
-      id: uuidv4(),
-      group_id: groupId,
-      file_name: file.originalname ?? file.filename,
-      status: 'IN_PROGRESS',
-      total_rows: 0,
-      accepted_rows: 0,
-      skipped_rows: 0,
-      blocked_rows: 0,
-      review_rows: 0,
-      created_by: req.userId ?? null,
-    },
-  });
+    const importRec = await prisma.import.create({
+      data: {
+        group_id: groupId,
+        file_name: file.originalname ?? file.filename,
+        status: 'IN_PROGRESS',
+        total_rows: 0,
+        accepted_rows: 0,
+        skipped_rows: 0,
+        blocked_rows: 0,
+        review_rows: 0,
+        created_by: req.userId ?? null,
+      },
+    });
 
-  const anomalies: any[] = [];
-  let totalRows = 0;
-  let accepted = 0;
-  let blocked = 0;
+    const anomalies: Array<{ rowNumber: number; type: string; message: string; raw_row: string }> = [];
+    let totalRows = 0;
+    let accepted = 0;
+    let blocked = 0;
 
-  const parser = fastCsv.parse({ headers: true, ignoreEmpty: true })
-    .on('error', (error) => anomalies.push({ type: 'PARSE_ERROR', message: error.message }))
-    .on('data', async (row) => {
+    const rows: any[] = [];
+    const fs = await import('fs');
+
+    await new Promise<void>((resolve, reject) => {
+      fs.createReadStream(file.path)
+        .pipe(fastCsv.parse({ headers: true, ignoreEmpty: true }))
+        .on('error', (error: Error) => {
+          anomalies.push({ rowNumber: 0, type: 'PARSE_ERROR', message: error.message, raw_row: '' });
+          reject(error);
+        })
+        .on('data', (row: any) => rows.push(row))
+        .on('end', () => resolve());
+    });
+
+    // Process rows sequentially
+    for (const row of rows) {
       totalRows++;
       try {
-        const { date, description, amount, currency, paidBy, splitType, splitUsers, splitPercentages, splitUnits } = row;
-        if (!date || !amount || !currency || !paidBy || !splitType) throw new Error('Missing required fields');
-        const group = await prisma.groups.findUnique({ where: { id: groupId } });
+        const { date, description, amount, currency, paidBy, splitType, splitUsers } = row;
+        if (!date || !amount || !currency || !paidBy || !splitType) {
+          throw new Error('Missing required fields');
+        }
+        const group = await prisma.group.findUnique({ where: { id: groupId } });
         const targetCurrency = group?.base_currency ?? 'INR';
         const rate = currency === targetCurrency ? 1 : await fetchRate(currency, targetCurrency);
         const converted = Number(amount) * rate;
 
-        const expense = await prisma.expenses.create({
+        const expense = await prisma.expense.create({
           data: {
-            id: uuidv4(),
             group_id: groupId,
             paid_by_user_id: paidBy,
             expense_date: new Date(date),
-            description,
+            description: description || 'Imported expense',
             original_amount: Number(amount),
             original_currency: currency,
             exchange_rate: rate,
@@ -134,92 +188,75 @@ router.post('/:groupId/import', upload.single('file'), async (req: AuthRequest, 
           },
         });
 
-        // Handle splits based on splitType
-        if (splitType === 'EQUAL') {
-          const users = splitUsers?.split(',').map((s: string) => s.trim()).filter(Boolean);
-          if (users && users.length > 0) {
+        if (splitType === 'EQUAL' && splitUsers) {
+          const users = splitUsers.split(',').map((s: string) => s.trim()).filter(Boolean);
+          if (users.length > 0) {
             const per = converted / users.length;
-            await Promise.all(users.map(u => prisma.expense_splits.create({
-              data: { id: uuidv4(), expense_id: expense.id, user_id: u, amount: per },
-            })));
-          }
-        } else if (splitType === 'PERCENTAGE') {
-          const entries = splitPercentages?.split(';').map((e: string) => e.trim()).filter(Boolean);
-          if (entries) {
-            await Promise.all(entries.map(entry => {
-              const [uid, percStr] = entry.split(':');
-              const perc = Number(percStr);
-              const amt = (perc / 100) * converted;
-              return prisma.expense_splits.create({
-                data: { id: uuidv4(), expense_id: expense.id, user_id: uid, amount: amt, percentage: perc },
-              });
-            }));
-          }
-        } else if (splitType === 'CUSTOM') {
-          const entries = splitUnits?.split(';').map((e: string) => e.trim()).filter(Boolean);
-          if (entries) {
-            const unitObjs = entries.map(entry => {
-              const [uid, unitStr] = entry.split(':');
-              return { uid, units: Number(unitStr) };
-            });
-            const totalUnits = unitObjs.reduce((sum, u) => sum + u.units, 0);
-            await Promise.all(unitObjs.map(u => {
-              const amt = (u.units / totalUnits) * converted;
-              return prisma.expense_splits.create({
-                data: { id: uuidv4(), expense_id: expense.id, user_id: u.uid, amount: amt, share_units: u.units },
-              });
-            }));
+            await Promise.all(
+              users.map((u: string) =>
+                prisma.expenseSplit.create({
+                  data: { expense_id: expense.id, user_id: u, amount: per },
+                })
+              )
+            );
           }
         }
-
         accepted++;
       } catch (e: any) {
-        anomalies.push({ rowNumber: totalRows, type: 'VALIDATION', message: e.message, raw_row: JSON.stringify(row) });
+        anomalies.push({
+          rowNumber: totalRows,
+          type: 'VALIDATION',
+          message: e.message,
+          raw_row: JSON.stringify(row),
+        });
         blocked++;
       }
+    }
+
+    // Update import record
+    await prisma.import.update({
+      where: { id: importRec.id },
+      data: {
+        status: 'COMPLETED',
+        total_rows: totalRows,
+        accepted_rows: accepted,
+        blocked_rows: blocked,
+      },
     });
 
-  // Pipe file stream into parser
-  await new Promise<void>((resolve, reject) => {
-    const fs = require('fs');
-    const stream = fs.createReadStream(file.path);
-    stream.pipe(parser).on('end', resolve).on('error', reject);
-  });
+    // Persist anomalies
+    if (anomalies.length > 0) {
+      await Promise.all(
+        anomalies.map((anom) =>
+          prisma.anomaly.create({
+            data: {
+              import_id: importRec.id,
+              row_number: anom.rowNumber,
+              type: anom.type,
+              severity: 'MEDIUM',
+              action: 'REVIEW',
+              message: anom.message,
+              raw_row: anom.raw_row,
+            },
+          })
+        )
+      );
+    }
 
-  // Update import record with final counts
-  await prisma.imports.update({
-    where: { id: importRec.id },
-    data: {
-      status: 'COMPLETED',
-      total_rows: totalRows,
-      accepted_rows: accepted,
-      blocked_rows: blocked,
-      skipped_rows: 0,
-      review_rows: 0,
-    },
-  });
+    // Clean up temp file
+    fs.unlinkSync(file.path);
 
-  // Persist anomalies
-  await Promise.all(anomalies.map(anom => prisma.anomalies.create({
-    data: {
-      id: uuidv4(),
-      import_id: importRec.id,
-      row_number: anom.rowNumber ?? 0,
-      type: anom.type,
-      severity: 'MEDIUM',
-      action: 'REVIEW',
-      message: anom.message,
-      raw_row: anom.raw_row ?? '',
-    },
-  })));
-
-  res.json({ importId: importRec.id, imported: accepted, anomalies });
+    res.json({
+      importId: importRec.id,
+      totalRows,
+      accepted,
+      blocked,
+      anomalies: anomalies.length,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
-
-/** Helper: fetch exchange rate */
-async function fetchRate(from: string, to: string): Promise<number> {
-  const resp = await axios.get('https://api.exchangerate.host/latest', { params: { base: from, symbols: to } });
-  return Number(resp.data.rates[to]);
-}
 
 export default router;

@@ -1,31 +1,25 @@
-// src/middleware/audit.ts
-import { Request, Response, NextFunction } from "express";
-import { prisma } from "../server";
+import { Request, Response, NextFunction } from 'express';
+import prisma from '../prisma';
+import { AuthRequest } from './auth';
 
-export const auditLog = async (req: Request, res: Response, next: NextFunction) => {
-  const start = Date.now();
-  const originalJson = res.json.bind(res);
-  // Capture response body after handler
-  res.json = async (body: any) => {
-    const duration = Date.now() - start;
-    const userId = (req as any).userId || null;
-    const groupId = (req as any).groupId || null;
-    const method = req.method;
-    const path = req.path;
-    const action = `${method} ${path}`;
-    const entityType = body?.entity?.type || null;
-    const entityId = body?.entity?.id || null;
-    await prisma.audit_logs.create({
+export const auditLog = async (req: AuthRequest, _res: Response, next: NextFunction) => {
+  // Fire-and-forget audit log
+  const userId = req.userId || null;
+  const method = req.method;
+  const path = req.originalUrl;
+  const action = `${method} ${path}`;
+
+  try {
+    await prisma.auditLog.create({
       data: {
         actor_user_id: userId,
-        group_id: groupId,
         action,
-        entity_type: entityType,
-        entity_id: entityId,
-        details: JSON.stringify(body),
+        entity_type: 'request',
+        details: JSON.stringify({ method, path, body: req.body }),
       },
     });
-    return originalJson(body);
-  };
+  } catch (e) {
+    console.error('Audit log failed:', e);
+  }
   next();
 };
